@@ -12,7 +12,10 @@
 在 `pqa-local` 目录下：
 
 ```powershell
-# 1) 建库（第一次约 4 分钟；以后只处理新增/修改的 PDF）
+# 可选但推荐：支持加密 PDF 和 pypdf 失败后的备用解析
+.\.venv\Scripts\python.exe -m pip install cryptography -e ../packages/paper-qa-pymupdf
+
+# 1) 建库（默认 ../../PDF；以后只处理新增/修改的 PDF）
 .\.venv\Scripts\python.exe build_index.py --allow-low-entropy-text
 
 # 2) 提问（每次只加载缓存 + embedding 一个问题）
@@ -22,25 +25,24 @@
 .\.venv\Scripts\python.exe ask_index.py --retrieval-only -k 10 "research methods"
 ```
 
-`--allow-low-entropy-text` 只影响 PaperQA 的「文本熵」合法性检查，用来收录 2 篇字符种类特别多的中文论文；如果从零重建且不需要这两篇，可以去掉。
+`--allow-low-entropy-text` 只影响 PaperQA 的「文本熵」合法性检查；它不能替代扫描件 OCR。
 
 当前 `index/docs.pkl` 的实测结果：
 
 | 指标 | 数值 |
 | --- | --- |
-| 成功索引 | 95 篇 PDF |
-| chunk 数 | 1,373 |
-| 缓存大小 | 19.1 MB |
-| 向量矩阵 | 约 5.4 MB（1,373 × 1024 × 4B） |
-| 建库耗时 | 约 4 分钟（232.8s） |
-| 失败 | 8 篇（字体/ToUnicode 编码损坏） |
-| 重复文件 | 0 |
+| PDF 文件 | 1,228 篇 |
+| 成功索引 | 1,212 篇（另有 10 篇内容重复） |
+| chunk 数 | 17,446 |
+| 缓存大小 | 244.8 MB |
+| 向量矩阵 | 约 68.2 MB（17,446 × 1024 × 4B） |
+| 待 OCR/修复 | 6 篇 |
 
 常用参数：
 
 ```powershell
-# 同时索引 文件 和 papers 两个目录
-.\.venv\Scripts\python.exe build_index.py --corpus ..\文件 .\papers
+# 同时索引旧语料和 papers 两个目录
+.\.venv\Scripts\python.exe build_index.py --corpus ..\..\文件 .\papers
 
 # 只索引前 2 篇做小规模测试
 .\.venv\Scripts\python.exe build_index.py --rebuild --limit 2
@@ -64,7 +66,7 @@
 .\.venv\Scripts\python.exe agent_ask.py --search-count 6 --max-timesteps 10 --evidence-k 6 "your question"
 ```
 
-`build_agent_index.py` 直接从 `docs.pkl` 生成 Tantivy 全文索引和每篇论文的 chunk 缓存，**不会重新 embedding，也不会重新让 LLM 生成 citation**。本机实测约 4.7 秒，索引 13.4 MB。
+`build_agent_index.py` 直接从 `docs.pkl` 生成 Tantivy 全文索引和每篇论文的 chunk 缓存，**不会重新 embedding，也不会重新让 LLM 生成 citation**。当前全量同步实测约 85 秒，索引 166.8 MB。
 
 `agent_ask.py` 的实测行为（中文问题）：
 
@@ -120,7 +122,9 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 
 **一致性检查**（`answer_lint.py`）：统一同一统计的计数口径（同一数字前后不得矛盾）；对“文献中不存在”类全称否定强制附加“本轮检索”限定；已打印 PDF 页码时删除“页码未给出/缺失”类矛盾表述（印刷页缺失的诚实说明保留）。
 
-**FIND 多路检索 + 检索审计**（`retrieval_audit.py` + `task_router.find_retrieval_plans`）：FIND 问题先按主题计划执行多路查询（如某主题：8 条关键词 + 4 条带引号短语）把候选预置进语料池，再交 agent 取证；每次 `paper_search` 的 query、候选、排名、dockey 都会被记录，运行后写入 `audit/audit_*.json`，可查每篇文献的旅程（候选 best_rank/hit_by → 是否进入证据 → 是否被正文引用 → 排除原因，未知原因如实标“未说明”）。审计不记录 API key，不保存整篇论文。
+**FIND 多路检索 + 检索审计**（`retrieval_audit.py` + `task_router.find_retrieval_plans`）：FIND 问题先把原问题的向量检索与主题多路查询（如某主题：8 条关键词 + 4 条带引号短语）的候选并集预置进语料池，再交 agent 取证；向量路径只调用一次问题 embedding，不调用答案模型。每次 `paper_search` 和预置检索的 query、候选、排名、dockey 都会被记录，运行后写入 `audit/audit_*.json`，可查每篇文献的旅程（候选 best_rank/hit_by → 是否进入证据 → 是否被正文引用 → 排除原因，未知原因如实标“未说明”）。审计不记录 API key，不保存整篇论文。
+
+**按论文评测召回**（`retrieval_check.py`）：`--expect` 指定已知相关论文的 docname 片段（可重复），分别比较关键词、向量、可选短语和 RRF 混合排序的 `Recall@k`，并区分未入库与已入库但未召回。它只计算已标注论文的召回，不据此承诺全库穷尽；不生成答案。
 
 **引文逐字核验**（`citation_fix.verify_quoted_excerpts`）：答案中带引号的英文摘录必须是证据文本的逐字子串（容忍换行、空白和排印字符差异，核验前剥离内嵌引用标注）；不匹配时去掉引号并把“原文摘录”降级为“释义”。统计区“引用能回读到证据片段”与“引号内容通过逐字核验”分列报告。
 
@@ -163,16 +167,16 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 
 ## 设计要点
 
-- **向量库**：`NumpyVectorStore`。当前 1,373 个 chunk、1024 维，检索矩阵约 5.4 MB，精确余弦检索足够快；不需要 Qdrant。
+- **向量库**：`NumpyVectorStore`。当前 17,446 个 chunk、1024 维，检索矩阵约 68.2 MB，精确余弦检索足够快；不需要 Qdrant。
 - **缓存**：pickle 整个 `Docs`（官方文档明确支持用 pickle 缓存 embeddings）。写盘前清空 `texts_index`，因为它的 `texts_hashes` 依赖 Python 进程级字符串哈希；加载后 PaperQA 会用已保存的 embedding 在本地重建矩阵，不调用 API。
 - **稳定的 docname/citation**：建库时不传 `citation=None`，而是用文件名 + 文件夹 ID，避免每次让 LLM 生成不同 citation。切块和 docname 固定，检索结果可复现。
-- **增量/并发**：按排序后的路径顺序逐篇添加，保证 docname 去重结果稳定；每 10 篇保存一次，失败可续跑。
+- **增量/并发**：按排序后的路径顺序逐篇添加，保证 docname 去重结果稳定；定期保存，失败可续跑。
 
 ## 已知限制
 
-- 当前只索引 PDF。`文件` 里的 2 个 `.xlsx`、1 个 `.docx`、1 个 `.doc` 不会被索引；`.docx/.xlsx` 还需要 `unstructured` 依赖，`.doc` PaperQA 不支持。
-- 8 个 PDF（多数为中文，含 4 篇 60–118 页的学位论文）因字体/ToUnicode 编码损坏，`pypdf` 会报 `UnicodeDecodeError: 'utf-16-be' ... truncated data`。详见 `index/build_report.json` 的 `errors`。建议用 Word 打开后另存为新的 PDF/TXT，再放回语料重跑。
-- PaperQA 有一个「文本熵」合法性检查，会把字符种类特别多的中文论文误判为非文本（`This does not look like a text document`）。对这类高质量中文 PDF，可加 `--allow-low-entropy-text` 重跑；本目录最终索引已用该参数补入 2 篇。
+- 当前只索引 PDF；`.docx/.xlsx` 需要 `unstructured` 依赖，`.doc` PaperQA 不支持。
+- 仍有 6 个 PDF 未收录：1 个空文件，5 个无可用正文（备用解析仅得到 0 或 12 个字符），需要 OCR 或修复原文件。详见 `index/build_report.json` 的 `errors`。
+- PaperQA 有一个「文本熵」合法性检查，会把字符种类特别多的中文论文误判为非文本（`This does not look like a text document`）。对这类有实际正文的 PDF，可加 `--allow-low-entropy-text` 重跑；扫描件仍需 OCR。
 - 引用显示为「文件名 [文件夹ID]」，不是正式文献格式；如需作者/年份/DOI，可后续接 manifest 或改用 `DocDetails`。
 - 综述档（`agent_qa.py --review`）为追求覆盖面把 `search_count`/`evidence_k`/`answer_max_sources` 都提到 40，单次问答成本约 $0.10-0.15，是标准档的 5 倍左右；写综述再用，日常问答用标准档即可。
 - `.env` 里有真实 API key，不要提交到 Git 或发给别人。
@@ -181,7 +185,8 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 
 | 文件 | 作用 |
 | --- | --- |
-| `build_index.py` | 一次性/增量建库（Docs 缓存） |
+| `build_index.py` | 一次性/增量建库（Docs 缓存）；单篇 pypdf 失败可用 PyMuPDF 备用解析，正文过少则要求 OCR |
+| `retrieval_check.py` | 不生成答案，按标注论文比较关键词/向量/短语/混合检索的 Recall@k |
 | `ask_index.py` | 加载缓存并做一次性问答（A） |
 | `build_agent_index.py` | 从 Docs 缓存建 Tantivy 索引（B，不重新 embedding） |
 | `agent_ask.py` | agent 多轮检索问答（B，单次调试/基准工具） |

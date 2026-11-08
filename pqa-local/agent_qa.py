@@ -61,6 +61,7 @@ from citation_fix import (
     save_manifest,
 )
 from cjk_search import install_cjk_query_patch
+from index_cache import cache_metadata, load_docs
 from paper_ledger import PaperLedger
 from paperqa.agents.env import PaperQAEnvironment
 from paperqa.agents.main import agent_query
@@ -79,7 +80,8 @@ from task_router import (
 )
 
 DEFAULT_INDEX_DIR = BASE_DIR / "index_agent"
-DEFAULT_CORPUS = BASE_DIR.parent / "文件"
+DEFAULT_CORPUS = BASE_DIR.parent.parent / "PDF"
+DEFAULT_CACHE = BASE_DIR / "index" / "docs.pkl"
 DEFAULT_MANIFEST = BASE_DIR / "index" / "citation_manifest.json"
 DEFAULT_AUDIT_DIR = BASE_DIR / "audit"
 
@@ -253,10 +255,9 @@ async def run_one(
     """Run one agent query, post-process citations, print stats, save audit.
 
     Every ``paper_search`` call is audited (query, top_n, ranked candidates).
-    FIND questions additionally pre-seed multi-query candidates (keywords +
-    exact phrases) into the corpus pool before the agent starts -- phrase
-    queries are what surface exact formulations the LLM's broad keyword
-    queries miss at this corpus size.
+    FIND questions additionally pre-seed vector, keyword, and exact-phrase
+    candidates into the corpus pool before the agent starts. These are candidate
+    unions, so the vector path does not replace or narrow keyword retrieval.
 
     Returns (displayed answer text, paper ledger, audit payload).
     """
@@ -265,16 +266,23 @@ async def run_one(
     audit.install_hook()
 
     docs: Docs | None = None
-    if intent is Intent.FIND:
-        plans = find_retrieval_plans(question)
-        if plans:
-            docs = Docs()
-            n_pre = await audit.run_retrieval_plans(docs, plans, settings)
-            print(
-                f"(FIND多路检索预置: {len(plans)} 条查询"
-                f"(关键词+短语), 新增 {n_pre} 篇候选进入语料池)"
-            )
     try:
+        if intent is Intent.FIND:
+            docs = Docs()
+            corpus_docs, _ = load_docs(
+                DEFAULT_CACHE, expected_meta=cache_metadata(settings)
+            )
+            n_vector = await audit.run_vector_query(
+                docs, corpus_docs, question, settings
+            )
+            print(f"(FIND向量检索预置: 新增 {n_vector} 篇候选进入语料池)")
+            plans = find_retrieval_plans(question)
+            if plans:
+                n_pre = await audit.run_retrieval_plans(docs, plans, settings)
+                print(
+                    f"(FIND多路检索预置: {len(plans)} 条查询"
+                    f"(关键词+短语), 新增 {n_pre} 篇候选进入语料池)"
+                )
         if docs is not None:
             response = await agent_query(
                 question, settings, docs=docs, env_class=PreserveDocsEnvironment

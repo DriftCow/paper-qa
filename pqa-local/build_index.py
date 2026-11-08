@@ -19,6 +19,9 @@ Notes
   deterministic citation.  Indexing therefore costs embeddings only.
 * Files are added sequentially so that automatic docname de-duplication stays
   deterministic.  Progress is saved every few files and can be resumed.
+* Document-specific pypdf failures retry with the optional PyMuPDF reader.
+  Fallbacks extracting fewer than 100 characters are rejected for OCR/repair.
+* Consecutive-error aborts count service/configuration failures, not bad PDFs.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from paperqa import Docs
 from qa import build_settings
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CORPUS = BASE_DIR.parent / "文件"
+DEFAULT_CORPUS = BASE_DIR.parent.parent / "PDF"
 DEFAULT_CACHE = BASE_DIR / "index" / "docs.pkl"
 DEFAULT_REPORT = BASE_DIR / "index" / "build_report.json"
 
@@ -66,6 +69,52 @@ def discover_pdfs(corpus: Path) -> list[Path]:
 
 def human_mb(n: int) -> str:
     return f"{n / (1024 * 1024):.1f} MB"
+
+
+def is_document_error(exc: BaseException) -> bool:
+    """Whether an exception is specific to one PDF rather than the service."""
+    if isinstance(exc, UnicodeDecodeError):
+        return True
+    if type(exc).__name__ in {
+        "DependencyError",
+        "ImpossibleParsingError",
+        "LimitReachedError",
+    }:
+        return True
+    return isinstance(exc, ValueError) and "This does not look like a text document" in str(
+        exc
+    )
+
+
+async def aadd_with_pdf_fallback(docs: Docs, path: Path, settings, **kwargs):
+    """Retry a document-specific pypdf failure with PyMuPDF when available."""
+    try:
+        return await docs.aadd(path, settings=settings, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - classified before trying the fallback
+        if not is_document_error(exc):
+            raise
+        try:
+            from paperqa_pymupdf import parse_pdf_to_pages
+        except ImportError:
+            raise exc
+        parsed = parse_pdf_to_pages(path, parse_media=False)
+        n_chars = sum(
+            len(value if isinstance(value, str) else value[0])
+            for value in parsed.content.values()
+        )
+        if n_chars < 100:
+            raise ValueError(
+                f"PyMuPDF fallback extracted only {n_chars} characters from {path}; "
+                "the PDF needs OCR or repair."
+            ) from exc
+        print(
+            f"      primary parser {type(exc).__name__}; "
+            f"retrying {n_chars:,} extracted chars with PyMuPDF",
+            flush=True,
+        )
+        fallback_settings = settings.model_copy(deep=True)
+        fallback_settings.parsing.parse_pdf = parse_pdf_to_pages
+        return await docs.aadd(path, settings=fallback_settings, **kwargs)
 
 
 def load_report(path: Path) -> dict:
@@ -135,7 +184,7 @@ async def main() -> None:
         type=Path,
         nargs="+",
         default=[DEFAULT_CORPUS],
-        help="One or more directories containing PDFs (default: ../文件).",
+        help="One or more directories containing PDFs (default: ../../PDF).",
     )
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
@@ -269,9 +318,10 @@ async def main() -> None:
                 docname = None
                 for attempt in range(1, args.max_rate_retries + 1):
                     try:
-                        docname = await docs.aadd(
+                        docname = await aadd_with_pdf_fallback(
+                            docs,
                             path,
-                            settings=settings,
+                            settings,
                             citation=f"{path.stem} [{path.parent.name}]",
                             docname=path.stem,
                         )
@@ -314,7 +364,9 @@ async def main() -> None:
                 consecutive_errors = 0
             except Exception as e:  # noqa: BLE001 - keep going, report per file
                 elapsed = time.perf_counter() - t0
-                consecutive_errors += 1
+                document_error = is_document_error(e)
+                if not document_error:
+                    consecutive_errors += 1
                 err = {
                     "path": str(rel),
                     "type": type(e).__name__,
@@ -324,10 +376,14 @@ async def main() -> None:
                 }
                 report["errors"].append(err)
                 print(f"      ERROR {type(e).__name__}: {e}", flush=True)
-                if consecutive_errors >= args.max_consecutive_errors:
+                if (
+                    not document_error
+                    and consecutive_errors >= args.max_consecutive_errors
+                ):
                     print(
-                        f"Aborting after {consecutive_errors} consecutive errors. "
-                        "Fix the configuration and re-run; progress is saved.",
+                        f"Aborting after {consecutive_errors} consecutive "
+                        "non-document errors. Fix the configuration and re-run; "
+                        "progress is saved.",
                         flush=True,
                     )
                     save_docs(docs, args.cache, meta, created_at=created_at)

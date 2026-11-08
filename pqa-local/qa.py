@@ -23,6 +23,7 @@ load_dotenv(BASE_DIR / ".env")
 import litellm
 from paperqa import Docs, Settings
 from paperqa.settings import AgentSettings, MultimodalOptions, ParsingSettings
+from paperqa_pypdf import parse_pdf_to_pages as parse_pdf_pypdf
 
 
 def _register_llm_pricing(model: str) -> None:
@@ -110,6 +111,8 @@ def build_settings() -> Settings:
         },
         agent=AgentSettings(agent_llm=model, agent_llm_config=llm_config),
         parsing=ParsingSettings(
+            # Keep cache identity stable when the optional PyMuPDF extra is installed.
+            parse_pdf=parse_pdf_pypdf,
             # text-only LLM, so skip image parsing/enrichment
             multimodal=MultimodalOptions.OFF,
             # skip Crossref/Semantic Scholar metadata lookups (rate-limited here)

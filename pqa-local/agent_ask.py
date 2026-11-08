@@ -31,7 +31,7 @@ from qa import build_settings
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INDEX_DIR = BASE_DIR / "index_agent"
-DEFAULT_CORPUS = BASE_DIR.parent / "文件"
+DEFAULT_CORPUS = BASE_DIR.parent.parent / "PDF"
 
 
 async def main() -> None:

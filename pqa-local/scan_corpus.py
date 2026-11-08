@@ -19,7 +19,7 @@ from pathlib import Path
 from pypdf import PdfReader
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CORPUS = BASE_DIR.parent / "文件"
+DEFAULT_CORPUS = BASE_DIR.parent.parent / "PDF"
 CHUNK_CHARS = 5000
 OVERLAP = 250
 WORKERS = 4
@@ -98,7 +98,7 @@ def main() -> None:
         type=Path,
         nargs="+",
         default=[DEFAULT_CORPUS],
-        help="One or more directories containing PDFs (default: ../文件).",
+        help="One or more directories containing PDFs (default: ../../PDF).",
     )
     parser.add_argument(
         "--out",
