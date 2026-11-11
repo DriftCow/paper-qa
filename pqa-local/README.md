@@ -151,7 +151,7 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 
 综述档还会覆盖两个 prompt：`prompts.qa` 要求中文分节综述 + 逐句引用 + 文末参考文献清单；`agent.agent_prompt` 要求 agent 用 4-6 个不同角度 query 多次检索并翻页。
 
-成本参考（DeepSeek input $0.27/M、output $1.10/M）：标准档约 **$0.02-0.03/次**，综述档约 **$0.10-0.15/次**（prompt caching 命中后更低）。
+成本参考（Kimi kimi-k2.8-preview input ¥6.5/M、output ¥27/M，缓存命中 input ¥1.7/M）：标准档约 **¥0.3-0.6/次**，综述档约 **¥1.8-2.6/次**（prompt caching 命中后更低）。
 
 ## 什么时候需要重建
 

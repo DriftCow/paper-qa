@@ -3,7 +3,7 @@
 Put one or more PDFs into the papers/ folder next to this script; all of them
 are indexed on each run, and the question is answered across all papers.
 
-LLM: DeepSeek (deepseek-chat) via OpenAI-compatible endpoint.
+LLM: Kimi (kimi-k2.8-preview) via OpenAI-compatible endpoint.
 Embedding: Aliyun DashScope text-embedding-v4 via OpenAI-compatible
 endpoint (override with DASHSCOPE_EMBEDDING_MODEL in .env).
 Keys are read from .env next to this script.
@@ -26,44 +26,59 @@ from paperqa.settings import AgentSettings, MultimodalOptions, ParsingSettings
 from paperqa_pypdf import parse_pdf_to_pages as parse_pdf_pypdf
 
 
+def _usd_cny_rate() -> float:
+    """USD→CNY exchange rate (KIMI_USD_CNY_RATE in .env) used both to
+    convert Kimi's CNY list prices into litellm's USD cost map and to
+    convert session costs back to CNY for display."""
+    return float(os.environ.get("KIMI_USD_CNY_RATE", "7.10"))
+
+
+def format_cost(usd: float) -> str:
+    """Render a litellm USD session cost in CNY (prices are CNY list prices).
+    Uses the fullwidth yen sign (U+FFE5) because the halfwidth one (U+00A5)
+    cannot be printed on Windows GBK consoles."""
+    return f"￥{usd * _usd_cny_rate():.4f}"
+
+
 def _register_llm_pricing(model: str) -> None:
     """LiteLLM's price map has no entry for the endpoint's model name, which
-    makes every call log "Failed to calculate cost". Register DeepSeek's list
-    prices (per million tokens, overridable via env) so per-call and session
-    costs are actually computed."""
+    makes every call log "Failed to calculate cost". Kimi's list prices are
+    quoted in CNY per million tokens (overridable via env), but litellm's cost
+    map is in USD, so register the CNY prices converted at KIMI_USD_CNY_RATE;
+    use format_cost() to show session costs back in CNY."""
     # Unmapped models make litellm print a "Provider List" banner on every
     # cost lookup; we register pricing ourselves, so silence it.
     litellm.suppress_debug_info = True
+    rate = _usd_cny_rate()
     prices = {
         "mode": "chat",
         "litellm_provider": "openai",
-        "max_tokens": 8192,
-        "max_input_tokens": 65536,
-        "max_output_tokens": 8192,
+        "max_tokens": 32768,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 32768,
         "input_cost_per_token": float(
-            os.environ.get("DEEPSEEK_INPUT_COST_PER_MTOK", "0.27")
+            os.environ.get("KIMI_INPUT_COST_PER_MTOK", "6.50")
         )
+        / rate
         / 1_000_000,
         "output_cost_per_token": float(
-            os.environ.get("DEEPSEEK_OUTPUT_COST_PER_MTOK", "1.10")
+            os.environ.get("KIMI_OUTPUT_COST_PER_MTOK", "27.00")
         )
+        / rate
         / 1_000_000,
         "cache_read_input_token_cost": float(
-            os.environ.get("DEEPSEEK_CACHE_READ_COST_PER_MTOK", "0.07")
+            os.environ.get("KIMI_CACHE_READ_COST_PER_MTOK", "1.70")
         )
+        / rate
         / 1_000_000,
         "supports_prompt_caching": True,
     }
-    # The gateway answers with model="deepseek-flash" even when the request
-    # asked for another name, so lmi's cost lookup (keyed on the response's
-    # model) needs an entry for that name too.
-    for name in {model, "deepseek-flash"}:
-        litellm.register_model({name: prices})
+    litellm.register_model({model: prices})
 
 
-def deepseek_llm_config() -> tuple[str, dict]:
-    """Return (model_name, LiteLLM Router model_list config) for DeepSeek."""
-    model = os.environ["DEEPSEEK_MODEL"]
+def kimi_llm_config() -> tuple[str, dict]:
+    """Return (model_name, LiteLLM Router model_list config) for Kimi."""
+    model = os.environ["KIMI_MODEL"]
     _register_llm_pricing(model)
     config = {
         "model_list": [
@@ -71,8 +86,8 @@ def deepseek_llm_config() -> tuple[str, dict]:
                 "model_name": model,
                 "litellm_params": {
                     "model": f"openai/{model}",
-                    "api_base": os.environ["DEEPSEEK_API_BASE"],
-                    "api_key": os.environ["DEEPSEEK_API_KEY"],
+                    "api_base": os.environ["KIMI_API_BASE"],
+                    "api_key": os.environ["KIMI_API_KEY"],
                 },
             }
         ]
@@ -81,7 +96,7 @@ def deepseek_llm_config() -> tuple[str, dict]:
 
 
 def build_settings() -> Settings:
-    model, llm_config = deepseek_llm_config()
+    model, llm_config = kimi_llm_config()
     embedding_model = os.environ.get(
         "SILICONFLOW_EMBEDDING_MODEL", "BAAI/bge-m3"
     )
@@ -154,7 +169,7 @@ async def main() -> None:
     print("\n=== Answer ===")
     print(session.answer)
     print(f"\n=== Contexts used: {len(session.contexts)} ===")
-    print(f"=== Cost (USD): {session.cost:.4f} ===")
+    print(f"=== Cost: {format_cost(session.cost)} ===")
 
 
 if __name__ == "__main__":

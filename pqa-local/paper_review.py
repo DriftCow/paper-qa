@@ -280,9 +280,9 @@ async def default_llm_judge(prompt: str) -> dict[str, Any]:
     import litellm
 
     response = await litellm.acompletion(
-        model=f"openai/{os.environ['DEEPSEEK_MODEL']}",
-        api_base=os.environ["DEEPSEEK_API_BASE"],
-        api_key=os.environ["DEEPSEEK_API_KEY"],
+        model=f"openai/{os.environ['KIMI_MODEL']}",
+        api_base=os.environ["KIMI_API_BASE"],
+        api_key=os.environ["KIMI_API_KEY"],
         temperature=0,
         timeout=120,
         num_retries=2,

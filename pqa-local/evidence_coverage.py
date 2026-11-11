@@ -125,16 +125,16 @@ def _collect_evidence(session) -> dict[str, PaperEvidence]:
 
 
 async def _default_judge(question: str, docname: str, evidence: list[str]) -> dict[str, Any]:
-    """One small DeepSeek call per uncited evidence paper."""
+    """One small Kimi call per uncited evidence paper."""
     import litellm
 
     body = "\n\n".join(
         f"[片段{i+1}]\n{t}" for i, t in enumerate(evidence)
     )
     response = await litellm.acompletion(
-        model=f"openai/{os.environ['DEEPSEEK_MODEL']}",
-        api_base=os.environ["DEEPSEEK_API_BASE"],
-        api_key=os.environ["DEEPSEEK_API_KEY"],
+        model=f"openai/{os.environ['KIMI_MODEL']}",
+        api_base=os.environ["KIMI_API_BASE"],
+        api_key=os.environ["KIMI_API_KEY"],
         messages=[
             {
                 "role": "user",

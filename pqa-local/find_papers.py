@@ -212,7 +212,7 @@ def _review_key(request: FindRequest, dockey: str, pack: EvidencePack) -> str:
             "dockey": dockey,
             "evidence": [span.span_id for span in pack.spans],
             "schema": PROMPT_SCHEMA_VERSION,
-            "model": os.environ.get("DEEPSEEK_MODEL", ""),
+            "model": os.environ.get("KIMI_MODEL", ""),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -499,7 +499,7 @@ async def run(args: argparse.Namespace) -> FindResult | None:
         "strict_corpus": args.strict_corpus,
         "retrieval_depth": args.depth,
         "retrieve_only": args.retrieve_only,
-        "llm_model": os.environ.get("DEEPSEEK_MODEL", ""),
+        "llm_model": os.environ.get("KIMI_MODEL", ""),
         "embedding_model": corpus.payload.get("embedding", ""),
         "prompt_schema": PROMPT_SCHEMA_VERSION,
     }

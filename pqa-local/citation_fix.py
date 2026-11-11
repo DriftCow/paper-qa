@@ -175,15 +175,15 @@ _LLM_EXTRACT_PROMPT = (
 
 
 async def default_llm_extract(first_text: str) -> dict[str, Any]:
-    """One small DeepSeek call per paper; result is cached in the manifest."""
+    """One small Kimi call per paper; result is cached in the manifest."""
     import os
 
     import litellm
 
     response = await litellm.acompletion(
-        model=f"openai/{os.environ['DEEPSEEK_MODEL']}",
-        api_base=os.environ["DEEPSEEK_API_BASE"],
-        api_key=os.environ["DEEPSEEK_API_KEY"],
+        model=f"openai/{os.environ['KIMI_MODEL']}",
+        api_base=os.environ["KIMI_API_BASE"],
+        api_key=os.environ["KIMI_API_KEY"],
         messages=[
             {"role": "user", "content": _LLM_EXTRACT_PROMPT + first_text[:4000]}
         ],

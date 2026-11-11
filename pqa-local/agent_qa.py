@@ -28,10 +28,11 @@ Single-shot mode (ask one question and exit, like the old demo):
 
     .\.venv\Scripts\python.exe agent_qa.py "这份语料库主要涵盖哪些研究主题?"
 
-Cost (DeepSeek list prices: input $0.27/M tokens, output $1.10/M)
------------------------------------------------------------------
-standard: ~60-80k prompt tokens per question   -> ~$0.02-0.03
-review:   ~250-350k prompt tokens per question -> ~$0.10-0.15
+Cost (Kimi kimi-k2.8-preview list prices: input ¥6.5/M tokens, output ¥27/M)
+------------------------------------------------------------------------
+standard: ~60-80k prompt tokens per question   -> ~¥0.3-0.6
+review:   ~250-350k prompt tokens per question -> ~¥1.8-2.6
+(cache-read input is only ¥1.7/M, so cached turns cost far less)
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ from paperqa.agents.env import PaperQAEnvironment
 from paperqa.agents.main import agent_query
 from paperqa.agents.models import AgentStatus
 from paperqa.docs import Docs
-from qa import build_settings
+from qa import build_settings, format_cost
 from retrieval_audit import RetrievalAudit
 from task_router import (
     EVIDENCE_DISCIPLINE,
@@ -147,7 +148,7 @@ PRESETS: dict[str, dict] = {
         "max_concurrent_requests": 8,
         "qa_prompt": None,  # keep paperqa's default prompts
         "agent_prompt": None,
-        "cost_hint": "约 $0.02-0.03/次",
+        "cost_hint": "约 ￥0.3-0.6/次",
     },
     "review": {
         "search_count": 40,
@@ -160,7 +161,7 @@ PRESETS: dict[str, dict] = {
         "max_concurrent_requests": 8,
         "qa_prompt": REVIEW_QA_PROMPT,
         "agent_prompt": REVIEW_AGENT_PROMPT,
-        "cost_hint": "约 $0.10-0.15/次",
+        "cost_hint": "约 ￥1.8-2.6/次",
     },
 }
 
@@ -172,8 +173,8 @@ REWRITE_SYSTEM_PROMPT = (
 
 HELP_TEXT = """\
 斜杠命令:
-  /review    切换到综述档(广检索、长答案,约 $0.10-0.15/次)
-  /standard  切换到标准档(日常问答,约 $0.02-0.03/次)
+  /review    切换到综述档(广检索、长答案,约 ￥1.8-2.6/次)
+  /standard  切换到标准档(日常问答,约 ￥0.3-0.6/次)
   /mode      查看当前档位及参数
   /new       清空对话历史和上一轮文献记录
   /history   查看本次会话的对话历史(含改写后的问题)
@@ -231,9 +232,9 @@ async def rewrite_question(history: list[dict], question: str) -> str:
         f"问:{h['question']}\n答:{h['answer'][:500]}" for h in history[-4:]
     )
     response = await litellm.acompletion(
-        model=f"openai/{os.environ['DEEPSEEK_MODEL']}",
-        api_base=os.environ["DEEPSEEK_API_BASE"],
-        api_key=os.environ["DEEPSEEK_API_KEY"],
+        model=f"openai/{os.environ['KIMI_MODEL']}",
+        api_base=os.environ["KIMI_API_BASE"],
+        api_key=os.environ["KIMI_API_KEY"],
         messages=[
             {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
             {"role": "user", "content": f"对话历史:\n{convo}\n\n追问:{question}"},
@@ -409,7 +410,7 @@ async def run_one(
     total_completion = sum(v[1] for v in session.token_counts.values())
     print(f"耗时: {elapsed:.1f}s | tokens: {total_prompt:,} in / {total_completion:,} out")
     if session.cost:
-        print(f"成本: ${session.cost:.4f} | 状态: {status}")
+        print(f"成本: {format_cost(session.cost)} | 状态: {status}")
     else:
         print(f"状态: {status}")
     if audit_dir is not None:
@@ -443,7 +444,7 @@ def _llm_extract_or_none():
     """LLM metadata extractor; disabled when API env is missing (offline)."""
     import os
 
-    if os.environ.get("DEEPSEEK_API_KEY"):
+    if os.environ.get("KIMI_API_KEY"):
         from citation_fix import default_llm_extract
 
         return default_llm_extract
