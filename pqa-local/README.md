@@ -32,11 +32,11 @@
 | 指标 | 数值 |
 | --- | --- |
 | PDF 文件 | 1,228 篇 |
-| 成功索引 | 1,212 篇（另有 10 篇内容重复） |
-| chunk 数 | 17,446 |
-| 缓存大小 | 244.8 MB |
-| 向量矩阵 | 约 68.2 MB（17,446 × 1024 × 4B） |
-| 待 OCR/修复 | 6 篇 |
+| 成功索引 | 1,217 篇（另有 10 篇内容重复；含 5 篇扫描件 OCR 修复版） |
+| chunk 数 | 17,466 |
+| 缓存大小 | 245.1 MB |
+| 向量矩阵 | 约 68.2 MB（17,466 × 1024 × 4B） |
+| 待修复 | 1 个空文件待重新下载（5 篇扫描件已 OCR 修复入库） |
 
 常用参数：
 
@@ -153,6 +153,23 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 
 成本参考（Kimi kimi-k2.8-preview input ¥6.5/M、output ¥27/M，缓存命中 input ¥1.7/M）：标准档约 **¥0.3-0.6/次**，综述档约 **¥1.8-2.6/次**（prompt caching 命中后更低）。
 
+## D：find_papers 批量筛查（内置 LLM 复核，token 预算制）
+
+`find_papers.py` 一次跑完「混合检索 → 逐篇 LLM 复核（核心度/立场）」，输出到 `reviews/<run-id>/`。旧版对全部候选做全量证据复核（几百篇 × 每篇几万字符），一次就能耗尽 token 预算；现在改为预算制：
+
+| 机制 | 默认 | 说明 |
+| --- | --- | --- |
+| `--max-candidates` | 120 | 只把 RRF 相关度前 N 篇候选送 LLM 复核；0=不限制。`--retrieve-only` 不受影响（保留全量候选供人工/agent 判定） |
+| 两级证据 | 初筛 3 片段×1200 字符 | 先用「摘要+命中块+结论」判核心度；仅 uncertain/低置信度才用全文证据（6 片段×2000 字符）复核，仅 core 进入立场判定 |
+| `--max-core` | 30 | main.md 最多详细展示 30 篇核心论文，按相关度（置信度→RRF）排序，最相关在前；其余仅列标题 |
+
+输出规则：支持立场给全文证据与逐字摘录；反对/中性等只给一句话理由简表；背景论文一行一篇附录；uncertain 只报计数不展开（明细都在 papers.csv）。papers.csv 按相关度排序，含 `relevance_rank`/`rrf_score` 列，保留全部明细供审计。
+
+```powershell
+.\.venv\Scripts\python.exe find_papers.py "你的问题" --run-id my_topic
+# 想要更广覆盖：--max-candidates 200 --max-core 40
+```
+
 ## 什么时候需要重建
 
 `index/docs.pkl` 与以下配置绑定，任一项变化都需要 `--rebuild`：
@@ -167,7 +184,7 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 
 ## 设计要点
 
-- **向量库**：`NumpyVectorStore`。当前 17,446 个 chunk、1024 维，检索矩阵约 68.2 MB，精确余弦检索足够快；不需要 Qdrant。
+- **向量库**：`NumpyVectorStore`。当前 17,466 个 chunk、1024 维，检索矩阵约 68.2 MB，精确余弦检索足够快；不需要 Qdrant。
 - **缓存**：pickle 整个 `Docs`（官方文档明确支持用 pickle 缓存 embeddings）。写盘前清空 `texts_index`，因为它的 `texts_hashes` 依赖 Python 进程级字符串哈希；加载后 PaperQA 会用已保存的 embedding 在本地重建矩阵，不调用 API。
 - **稳定的 docname/citation**：建库时不传 `citation=None`，而是用文件名 + 文件夹 ID，避免每次让 LLM 生成不同 citation。切块和 docname 固定，检索结果可复现。
 - **增量/并发**：按排序后的路径顺序逐篇添加，保证 docname 去重结果稳定；定期保存，失败可续跑。
@@ -175,7 +192,7 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 ## 已知限制
 
 - 当前只索引 PDF；`.docx/.xlsx` 需要 `unstructured` 依赖，`.doc` PaperQA 不支持。
-- 仍有 6 个 PDF 未收录：1 个空文件，5 个无可用正文（备用解析仅得到 0 或 12 个字符），需要 OCR 或修复原文件。详见 `index/build_report.json` 的 `errors`。
+- 仍有 1 个 PDF 未收录：`1189787598\艾旭-2018-加拿大油砂净能源产出量分析及预测 ——基于能源投入回报分析法.pdf` 为 0 字节空文件，需重新下载原文。5 篇扫描件已由 `ocr_repair.py` 生成不可见文本层修复版（`repaired_pdf/` 镜像，原始语料只读不改），经 `build_index.py --ocr-dir` 入库。详见 `index/build_report.json` 的 `errors`。
 - PaperQA 有一个「文本熵」合法性检查，会把字符种类特别多的中文论文误判为非文本（`This does not look like a text document`）。对这类有实际正文的 PDF，可加 `--allow-low-entropy-text` 重跑；扫描件仍需 OCR。
 - 引用显示为「文件名 [文件夹ID]」，不是正式文献格式；如需作者/年份/DOI，可后续接 manifest 或改用 `DocDetails`。
 - 综述档（`agent_qa.py --review`）为追求覆盖面把 `search_count`/`evidence_k`/`answer_max_sources` 都提到 40，单次问答成本约 $0.10-0.15，是标准档的 5 倍左右；写综述再用，日常问答用标准档即可。
@@ -185,7 +202,8 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 
 | 文件 | 作用 |
 | --- | --- |
-| `build_index.py` | 一次性/增量建库（Docs 缓存）；单篇 pypdf 失败可用 PyMuPDF 备用解析，正文过少则要求 OCR |
+| `build_index.py` | 一次性/增量建库（Docs 缓存）；单篇 pypdf 失败可用 PyMuPDF 备用解析，正文过少则要求 OCR；`--ocr-dir` 优先使用修复版镜像 |
+| `ocr_repair.py` | 扫描件 OCR 修复（RapidOCR + PyMuPDF 不可见文本层），输出到 `repaired_pdf/` 镜像，不改原始语料 |
 | `retrieval_check.py` | 不生成答案，按标注论文比较关键词/向量/短语/混合检索的 Recall@k |
 | `ask_index.py` | 加载缓存并做一次性问答（A） |
 | `build_agent_index.py` | 从 Docs 缓存建 Tantivy 索引（B，不重新 embedding） |
@@ -204,3 +222,6 @@ Tantivy 默认按空格/标点分词，中文长串会变成一个 token，直�
 | `index/build_report.json` | 建库报告：每篇 chunk 数、耗时、失败原因 |
 | `qa.py` | 原始 demo + 公共 `build_settings()`（每次重新 embedding；仅作对照） |
 | `agent_qa.py` | 多轮对话入口（任务路由 + 标准/综述双档，见上文「C」节） |
+| `find_papers.py` | 批量文献筛查：混合检索 + 预算制逐篇 LLM 复核，见上文「D」节 |
+| `paper_review.py` | 证据包构建与核心度/立场两级判定（find_papers 的复核引擎） |
+| `inspect_run.py` | find_papers 运行产物的限额查看器（防上下文爆炸） |

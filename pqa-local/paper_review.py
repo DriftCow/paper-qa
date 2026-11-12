@@ -179,15 +179,21 @@ class EvidenceBuilder:
         self,
         texts_by_dockey: dict[str, Sequence[Any]],
         chunk_by_id: dict[str, Any],
-        max_spans: int = 8,
-        span_chars: int = 4500,
+        max_spans: int = 6,
+        span_chars: int = 2000,
+        screen_spans: int = 3,
+        screen_chars: int = 1200,
     ):
         self.texts_by_dockey = texts_by_dockey
         self.chunk_by_id = chunk_by_id
         self.max_spans = max_spans
         self.span_chars = span_chars
+        self.screen_spans = screen_spans
+        self.screen_chars = screen_chars
 
-    def build(self, candidate: Candidate, expanded: bool = False) -> EvidencePack:
+    def build(
+        self, candidate: Candidate, expanded: bool = False, screening: bool = False
+    ) -> EvidencePack:
         from hybrid_retrieval import stable_chunk_id
 
         texts = list(self.texts_by_dockey.get(candidate.dockey, ()))
@@ -202,18 +208,37 @@ class EvidenceBuilder:
 
         add(0)
         id_to_index = {stable_chunk_id(text): i for i, text in enumerate(texts)}
-        for chunk_id in candidate.best_chunk_ids:
-            index = id_to_index.get(chunk_id)
-            if index is not None:
-                add(index)
-                add(index - 1)
-                add(index + 1)
-        for i, text in enumerate(texts):
-            section = detect_section(text.text, i / max(len(texts) - 1, 1))
-            if section in {"abstract", "methods", "results", "discussion", "conclusion"}:
-                add(i)
-        add(len(texts) - 1)
-        limit = self.max_spans * 2 if expanded else self.max_spans
+        if screening:
+            # 初筛只喂首块（标题/摘要）、最佳命中块与结论块，控制单篇 token。
+            for chunk_id in candidate.best_chunk_ids[:2]:
+                index = id_to_index.get(chunk_id)
+                if index is not None:
+                    add(index)
+            conclusion = next(
+                (
+                    i
+                    for i, text in enumerate(texts)
+                    if detect_section(text.text, i / max(len(texts) - 1, 1)) == "conclusion"
+                ),
+                len(texts) - 1,
+            )
+            add(conclusion)
+            limit = self.screen_spans
+            chars = self.screen_chars
+        else:
+            for chunk_id in candidate.best_chunk_ids:
+                index = id_to_index.get(chunk_id)
+                if index is not None:
+                    add(index)
+                    add(index - 1)
+                    add(index + 1)
+            for i, text in enumerate(texts):
+                section = detect_section(text.text, i / max(len(texts) - 1, 1))
+                if section in {"abstract", "methods", "results", "discussion", "conclusion"}:
+                    add(i)
+            add(len(texts) - 1)
+            limit = self.max_spans * 2 if expanded else self.max_spans
+            chars = self.span_chars * 2 if expanded else self.span_chars
         spans: list[EvidenceSpan] = []
         for index in sorted(list(indices)[:limit]):
             text = texts[index]
@@ -226,7 +251,7 @@ class EvidenceBuilder:
                     pages=pages_from_chunk_name(text.name),
                     section=section,
                     own_work_role=infer_evidence_role(section, text.text),
-                    text=_window(text.text, self.span_chars * 2 if expanded else self.span_chars),
+                    text=_window(text.text, chars),
                 )
             )
         return EvidencePack(candidate.dockey, docname, spans, expanded)

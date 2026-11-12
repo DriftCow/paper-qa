@@ -40,7 +40,7 @@ DEFAULT_CACHE = BASE_DIR / "index" / "docs.pkl"
 DEFAULT_INDEX_DIR = BASE_DIR / "index_agent"
 DEFAULT_BUILD_REPORT = BASE_DIR / "index" / "build_report.json"
 DEFAULT_MANIFEST = BASE_DIR / "index" / "citation_manifest.json"
-PROMPT_SCHEMA_VERSION = "find-papers-v1"
+PROMPT_SCHEMA_VERSION = "find-papers-v2"
 
 
 class Progress:
@@ -282,11 +282,47 @@ def _hit_summary(candidate: Candidate) -> str:
     )
 
 
+_STANCE_LABELS = {
+    "support": "支持",
+    "oppose": "反对",
+    "mixed": "混合",
+    "neutral": "中性",
+    "uncertain": "立场不确定",
+    "not_applicable": "不适用",
+}
+
+
+def _clip_reason(reason: str, limit: int) -> str:
+    flattened = " ".join((reason or "").split())
+    if len(flattened) <= limit:
+        return flattened or "未提供"
+    return flattened[: limit - 1] + "…"
+
+
+def limit_candidates(
+    candidates: list[Candidate], max_candidates: int
+) -> tuple[list[Candidate], int]:
+    """LLM 复核预算：按 RRF 相关度保留前 N 篇；0 表示不限制。"""
+    if max_candidates <= 0 or len(candidates) <= max_candidates:
+        return candidates, 0
+    return candidates[:max_candidates], len(candidates) - max_candidates
+
+
+def _relevance_key(candidate: Candidate, verdict: PaperVerdict) -> tuple:
+    tier = {"core": 0, "background": 1, "uncertain": 2, "irrelevant": 3}.get(
+        verdict.centrality, 4
+    )
+    if verdict.review_status != "completed":
+        tier = 4
+    return (tier, -verdict.confidence, -candidate.rrf_score, candidate.dockey)
+
+
 def _paper_block(
     verdict: PaperVerdict,
     candidate: Candidate,
     meta: dict[str, str],
     spans: dict[str, Any],
+    rank: int | None = None,
 ) -> str:
     evidence = []
     for span_id in verdict.evidence_ids:
@@ -297,15 +333,36 @@ def _paper_block(
         f"### {meta['title']}",
         f"- 文件：`{verdict.docname}`；dockey：`{verdict.dockey}`",
         f"- 核心度：**{verdict.centrality}**；立场：**{verdict.stance}**；置信度：{verdict.confidence:.2f}",
-        f"- 判定理由：{verdict.reason or '未提供'}",
-        f"- 命中来源：{_hit_summary(candidate) or 'strict全库补入'}",
-        f"- 证据位置：{'；'.join(dict.fromkeys(evidence)) or '待补充'}",
     ]
+    if rank is not None:
+        lines.append(f"- 相关度排名：#{rank}（RRF {candidate.rrf_score:.3f}）")
+    lines.extend(
+        [
+            f"- 判定理由：{verdict.reason or '未提供'}",
+            f"- 命中来源：{_hit_summary(candidate) or 'strict全库补入'}",
+            f"- 证据位置：{'；'.join(dict.fromkeys(evidence)) or '待补充'}",
+        ]
+    )
     if verdict.quote and verdict.quote_status == "verified":
         lines.append(f"- 原文摘录：\"{verdict.quote}\"")
     if verdict.error:
         lines.append(f"- 错误：`{verdict.error}`")
     return "\n".join(lines)
+
+
+def _compact_block(
+    verdict: PaperVerdict, meta: dict[str, str], rank: int
+) -> str:
+    """非支持立场的核心论文只给一行理由，不附摘录与证据明细。"""
+    stance = _STANCE_LABELS.get(verdict.stance, verdict.stance)
+    return "\n".join(
+        [
+            f"### {meta['title']}",
+            f"- 立场：**{stance}**；置信度：{verdict.confidence:.2f}；相关度排名：#{rank}",
+            f"- 理由：{_clip_reason(verdict.reason, 120)}",
+            f"- 文件：`{verdict.docname}`",
+        ]
+    )
 
 
 def write_outputs(
@@ -315,31 +372,106 @@ def write_outputs(
     manifest: dict[str, MetaEntry],
     packs: dict[str, EvidencePack],
     review_keys: dict[str, str] | None = None,
+    max_core: int = 30,
 ) -> None:
     import csv
 
     result.validate_accounting()
+    if max_core <= 0:
+        raise ValueError("max_core must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
     spans = _span_lookup(packs)
-    groups: dict[str, list[str]] = {"support": [], "oppose": [], "other": []}
-    background: list[str] = []
-    pending: list[str] = []
+    ordered = sorted(
+        result.candidates,
+        key=lambda c: _relevance_key(c, result.verdicts[c.dockey]),
+    )
+    core = [
+        c
+        for c in ordered
+        if result.verdicts[c.dockey].review_status == "completed"
+        and result.verdicts[c.dockey].centrality == "core"
+    ]
+    background = [
+        c
+        for c in ordered
+        if result.verdicts[c.dockey].review_status == "completed"
+        and result.verdicts[c.dockey].centrality == "background"
+    ]
+    uncertain_count = sum(
+        v.review_status == "completed" and v.centrality == "uncertain"
+        for v in result.verdicts.values()
+    )
+    problem = [
+        c
+        for c in ordered
+        if result.verdicts[c.dockey].review_status != "completed"
+    ]
+    detailed, overflow = core[:max_core], core[max_core:]
+    main = [
+        "# 核心相关论文（按相关度排序）",
+        "",
+        f"问题：{result.request.raw_question}",
+        "",
+        f"核心共 {len(core)} 篇，详细展示前 {len(detailed)} 篇"
+        "（--max-core 可调；支持立场给全文证据，其余立场只给一句话理由）。",
+    ]
+    for rank, candidate in enumerate(detailed, start=1):
+        verdict = result.verdicts[candidate.dockey]
+        meta = _meta(verdict.docname, docs.docs[candidate.dockey], manifest)
+        if verdict.stance == "support":
+            block = _paper_block(verdict, candidate, meta, spans, rank)
+        else:
+            block = _compact_block(verdict, meta, rank)
+        main.extend(["", block])
+    if overflow:
+        main.extend(
+            ["", f"## 其余核心论文（{len(overflow)}篇，明细见 papers.csv）", ""]
+        )
+        for candidate in overflow:
+            verdict = result.verdicts[candidate.dockey]
+            meta = _meta(verdict.docname, docs.docs[candidate.dockey], manifest)
+            stance = _STANCE_LABELS.get(verdict.stance, verdict.stance)
+            main.append(
+                f"- {meta['title']}（{stance}，置信度 {verdict.confidence:.2f}）"
+            )
+    (output_dir / "main.md").write_text("\n".join(main) + "\n", encoding="utf-8")
+    background_lines = [
+        f"# 背景相关附录（{len(background)}篇，仅列题名与一句话理由）",
+        "",
+    ]
+    for candidate in background:
+        verdict = result.verdicts[candidate.dockey]
+        meta = _meta(verdict.docname, docs.docs[candidate.dockey], manifest)
+        year = f"（{meta['year']}）" if meta["year"] else ""
+        background_lines.append(
+            f"- {meta['title']}{year}：{_clip_reason(verdict.reason, 80)}"
+        )
+    (output_dir / "background.md").write_text(
+        "\n".join(background_lines) + "\n", encoding="utf-8"
+    )
+    pending_lines = [f"# 待复核与失败项（{len(problem)}篇）", ""]
+    if uncertain_count:
+        pending_lines.append(
+            f"uncertain {uncertain_count} 篇：证据不足、关联度低，不再展开（明细见 papers.csv）。"
+        )
+        pending_lines.append("")
+    for candidate in problem:
+        verdict = result.verdicts[candidate.dockey]
+        meta = _meta(verdict.docname, docs.docs[candidate.dockey], manifest)
+        pending_lines.append(_paper_block(verdict, candidate, meta, spans))
+        pending_lines.append("")
+    (output_dir / "pending.md").write_text(
+        "\n".join(pending_lines) + "\n", encoding="utf-8"
+    )
     rows: list[dict[str, Any]] = []
-    for candidate in result.candidates:
+    for rank, candidate in enumerate(ordered, start=1):
         verdict = result.verdicts[candidate.dockey]
         doc = docs.docs[candidate.dockey]
         meta = _meta(verdict.docname, doc, manifest)
-        block = _paper_block(verdict, candidate, meta, spans)
-        if verdict.review_status == "completed" and verdict.centrality == "core":
-            group = verdict.stance if verdict.stance in {"support", "oppose"} else "other"
-            groups[group].append(block)
-        elif verdict.review_status == "completed" and verdict.centrality == "background":
-            background.append(block)
-        elif verdict.review_status != "completed" or verdict.centrality == "uncertain":
-            pending.append(block)
         quote_span = spans.get(verdict.quote_span_id)
         rows.append(
             {
+                "relevance_rank": rank,
                 "title": meta["title"],
                 "docname": verdict.docname,
                 "dockey": verdict.dockey,
@@ -351,6 +483,7 @@ def write_outputs(
                 "stance": verdict.stance,
                 "review_status": verdict.review_status,
                 "confidence": verdict.confidence,
+                "rrf_score": candidate.rrf_score,
                 "reason": verdict.reason,
                 "evidence_ids": " ".join(verdict.evidence_ids),
                 "pages": quote_span.pages if quote_span else "",
@@ -361,23 +494,6 @@ def write_outputs(
                 "error": verdict.error,
             }
         )
-    main = ["# 核心相关论文", "", f"问题：{result.request.raw_question}"]
-    for key, title in (
-        ("support", "支持"),
-        ("oppose", "反对"),
-        ("other", "中性、混合或立场不确定"),
-    ):
-        main.extend(["", f"## {title}（{len(groups[key])}篇）", ""])
-        main.append("\n\n".join(groups[key]) if groups[key] else "无")
-    (output_dir / "main.md").write_text("\n".join(main) + "\n", encoding="utf-8")
-    (output_dir / "background.md").write_text(
-        f"# 背景相关附录（{len(background)}篇）\n\n" + ("\n\n".join(background) or "无") + "\n",
-        encoding="utf-8",
-    )
-    (output_dir / "pending.md").write_text(
-        f"# 待复核与失败项（{len(pending)}篇）\n\n" + ("\n\n".join(pending) or "无") + "\n",
-        encoding="utf-8",
-    )
     with (output_dir / "papers.csv").open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else ["dockey"])
         writer.writeheader()
@@ -485,13 +601,31 @@ async def run(args: argparse.Namespace) -> FindResult | None:
             Candidate(dockey, best_rank=0)
             for dockey in sorted(set(corpus.docs.docs) - present)
         )
+    dropped = 0
+    if not args.retrieve_only:
+        candidates, dropped = limit_candidates(candidates, args.max_candidates)
+        if dropped:
+            progress.log(
+                f"复核预算：按 RRF 相关度保留前 {len(candidates)} 篇候选，"
+                f"{dropped} 篇低排名候选不送 LLM（--max-candidates 可调）"
+            )
     builder = EvidenceBuilder(corpus.texts_by_dockey, corpus.dense.chunk_by_id)
-    progress.stage(f"构建 {len(candidates)} 篇论文的证据片段……")
-    packs = {candidate.dockey: builder.build(candidate) for candidate in candidates}
-    expanded = {
-        candidate.dockey: builder.build(candidate, expanded=True)
-        for candidate in candidates
-    }
+    if args.retrieve_only:
+        progress.stage(f"构建 {len(candidates)} 篇论文的证据片段……")
+        packs = {candidate.dockey: builder.build(candidate) for candidate in candidates}
+        expanded = {
+            candidate.dockey: builder.build(candidate, expanded=True)
+            for candidate in candidates
+        }
+    else:
+        progress.stage(
+            f"构建 {len(candidates)} 篇论文的证据片段（初筛精简版，复核降级时才用全文）……"
+        )
+        packs = {
+            candidate.dockey: builder.build(candidate, screening=True)
+            for candidate in candidates
+        }
+        expanded = {candidate.dockey: builder.build(candidate) for candidate in candidates}
     progress.done("证据片段构建完成")
     all_packs = dict(packs)
     for dockey, pack in expanded.items():
@@ -573,6 +707,9 @@ async def run(args: argparse.Namespace) -> FindResult | None:
         "strict_corpus": args.strict_corpus,
         "retrieval_depth": args.depth,
         "retrieve_only": args.retrieve_only,
+        "max_candidates": args.max_candidates,
+        "candidates_dropped": dropped,
+        "max_core": args.max_core,
         "llm_model": os.environ.get("KIMI_MODEL", ""),
         "embedding_model": corpus.payload.get("embedding", ""),
         "prompt_schema": PROMPT_SCHEMA_VERSION,
@@ -586,7 +723,10 @@ async def run(args: argparse.Namespace) -> FindResult | None:
         errors,
     )
     progress.stage("写出结果文件……")
-    write_outputs(result, output_dir, corpus.docs, corpus.manifest, all_packs, keys)
+    write_outputs(
+        result, output_dir, corpus.docs, corpus.manifest, all_packs, keys,
+        max_core=args.max_core,
+    )
     progress.log(f"结果目录：{output_dir}")
     progress.log(f"统计：{result.counts}；完整运行：{result.is_complete}")
     progress.done(f"全部完成，总耗时 {progress.elapsed:.1f}s")
@@ -605,6 +745,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-query-expansion", action="store_true")
     parser.add_argument("--max-variants", type=int, default=10)
     parser.add_argument("--depth", type=int, default=80, help="每路每查询的论文深度")
+    parser.add_argument(
+        "--max-candidates", type=int, default=120,
+        help="LLM 复核候选上限，按 RRF 相关度截断（0=不限制；--retrieve-only 不受影响）",
+    )
+    parser.add_argument(
+        "--max-core", type=int, default=30,
+        help="main.md 详细展示的核心论文上限，其余仅列标题（明细仍在 papers.csv）",
+    )
     parser.add_argument("--max-review", type=int, help="显式复核预算；其余论文进入pending")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--strict-corpus", action="store_true", help="全部已索引论文至少复核一次")
@@ -627,6 +775,8 @@ def main() -> None:
     args = make_parser().parse_args()
     if args.depth <= 0 or args.concurrency <= 0:
         raise SystemExit("--depth and --concurrency must be positive")
+    if args.max_core <= 0 or args.max_candidates < 0:
+        raise SystemExit("--max-core must be positive and --max-candidates non-negative")
     if args.resume and not (args.resume / "result.json").exists():
         raise SystemExit("--resume directory must contain result.json")
     asyncio.run(run(args))
