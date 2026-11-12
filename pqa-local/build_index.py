@@ -21,6 +21,9 @@ Notes
   deterministic.  Progress is saved every few files and can be resumed.
 * Document-specific pypdf failures retry with the optional PyMuPDF reader.
   Fallbacks extracting fewer than 100 characters are rejected for OCR/repair.
+* ``--ocr-dir`` points at a mirror of OCR-repaired PDFs (same relative paths as
+  the corpus, produced by ocr_repair.py); repaired copies are indexed instead
+  of the read-only originals, which are never modified.
 * Consecutive-error aborts count service/configuration failures, not bad PDFs.
 """
 
@@ -186,6 +189,14 @@ async def main() -> None:
         default=[DEFAULT_CORPUS],
         help="One or more directories containing PDFs (default: ../../PDF).",
     )
+    parser.add_argument(
+        "--ocr-dir",
+        type=Path,
+        default=None,
+        help="Mirror dir of OCR-repaired PDFs (same relative paths as the "
+        "corpus, see ocr_repair.py); repaired copies replace originals at "
+        "index time without touching the read-only corpus.",
+    )
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     parser.add_argument("--rebuild", action="store_true", help="Ignore any cache.")
@@ -243,6 +254,24 @@ async def main() -> None:
     files = sorted(
         {p for c in corpora for p in discover_pdfs(c)}, key=lambda p: str(p).lower()
     )
+    override_map: dict[Path, Path] = {}
+    if args.ocr_dir:
+        swapped = []
+        for p in files:
+            rel = display_path(p, corpora)
+            ov = args.ocr_dir / rel
+            if not rel.is_absolute() and ov.is_file():
+                override_map[ov] = p
+                swapped.append(ov)
+            else:
+                swapped.append(p)
+        files = swapped
+        print(f"OCR overrides: {len(override_map)} repaired PDF(s) from {args.ocr_dir}")
+
+    def shown(p: Path) -> Path:
+        """Report paths always refer to the original corpus location."""
+        return display_path(override_map.get(p, p), corpora)
+
     if not files:
         sys.exit(f"No PDFs found under {', '.join(map(str, corpora))}")
 
@@ -261,14 +290,19 @@ async def main() -> None:
         if digest in path_by_md5:
             duplicates.append(
                 {
-                    "kept": str(display_path(path_by_md5[digest], corpora)),
-                    "duplicate": str(display_path(path, corpora)),
+                    "kept": str(shown(path_by_md5[digest])),
+                    "duplicate": str(shown(path)),
                 }
             )
         else:
             path_by_md5[digest] = path
 
     report = load_report(args.report)
+    # Drop stale errors for files no longer in the corpus (e.g. removed bad PDFs).
+    current_rel = {str(shown(p)) for p in files}
+    report["errors"] = [
+        e for e in report.get("errors", []) if e["path"] in current_rel
+    ]
     report.update(
         {
             "corpus": [str(c) for c in corpora],
@@ -310,7 +344,7 @@ async def main() -> None:
         consecutive_errors = 0
         indexed_now = 0
         for i, path in enumerate(new_files, start=1):
-            rel = display_path(path, corpora)
+            rel = shown(path)
             print(f"[{i}/{len(new_files)}] {rel} ...", flush=True)
             before = len(docs.texts)
             t0 = time.perf_counter()

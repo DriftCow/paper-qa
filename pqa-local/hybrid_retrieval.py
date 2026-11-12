@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 from lmi import EmbeddingModes
@@ -235,10 +235,18 @@ class HybridRetriever:
         self.tantivy = tantivy
 
     async def search(
-        self, queries: Sequence[QuerySpec], embedding_model: Any, depth: int = 80
+        self,
+        queries: Sequence[QuerySpec],
+        embedding_model: Any,
+        depth: int = 80,
+        on_progress: Callable[[QuerySpec, str, int, int], None] | None = None,
     ) -> HybridResult:
         rankings: list[list[PaperHit]] = []
         errors: list[str] = []
+        total = sum(
+            2 if spec.channel == "both" else 1 for spec in queries
+        )
+        done = 0
         for spec in queries:
             channels = ("keyword", "vector") if spec.channel == "both" else (spec.channel,)
             for channel in channels:
@@ -259,4 +267,7 @@ class HybridRetriever:
                     rankings.append(ranking)
                 except Exception as exc:  # Keep partial results and make incompleteness visible.
                     errors.append(f"{spec.query_id}/{channel}: {type(exc).__name__}: {exc}")
+                done += 1
+                if on_progress is not None:
+                    on_progress(spec, channel, done, total)
         return HybridResult(reciprocal_rank_fusion(rankings), errors)

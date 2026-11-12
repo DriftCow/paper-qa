@@ -283,7 +283,7 @@ async def default_llm_judge(prompt: str) -> dict[str, Any]:
         model=f"openai/{os.environ['KIMI_MODEL']}",
         api_base=os.environ["KIMI_API_BASE"],
         api_key=os.environ["KIMI_API_KEY"],
-        temperature=0,
+        # coding 端点仅允许 temperature=1，故不传该参数（与其他调用点一致）
         timeout=120,
         num_retries=2,
         messages=[{"role": "user", "content": prompt}],
@@ -438,6 +438,7 @@ class PaperReviewer:
         concurrency: int = 4,
         max_review: int | None = None,
         on_verdict: Callable[[PaperVerdict], None] | None = None,
+        on_progress: Callable[[int, int, PaperVerdict], None] | None = None,
     ) -> dict[str, PaperVerdict]:
         if concurrency <= 0:
             raise ValueError("concurrency must be positive")
@@ -446,11 +447,16 @@ class PaperReviewer:
         semaphore = asyncio.Semaphore(concurrency)
         selected = set(range(len(candidates) if max_review is None else max_review))
         verdicts: dict[str, PaperVerdict] = {}
+        done = 0
 
         def store(verdict: PaperVerdict) -> None:
+            nonlocal done
             verdicts[verdict.dockey] = verdict
+            done += 1
             if on_verdict is not None:
                 on_verdict(verdict)
+            if on_progress is not None:
+                on_progress(done, len(candidates), verdict)
 
         async def run_one(index: int, candidate: Candidate) -> None:
             pack = packs[candidate.dockey]

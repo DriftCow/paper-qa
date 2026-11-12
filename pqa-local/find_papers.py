@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any, Sequence
 
 from citation_fix import MetaEntry, load_manifest
@@ -40,6 +41,30 @@ DEFAULT_INDEX_DIR = BASE_DIR / "index_agent"
 DEFAULT_BUILD_REPORT = BASE_DIR / "index" / "build_report.json"
 DEFAULT_MANIFEST = BASE_DIR / "index" / "citation_manifest.json"
 PROMPT_SCHEMA_VERSION = "find-papers-v1"
+
+
+class Progress:
+    """Lightweight stage/elapsed-time reporter so long runs are not silent."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.start = time.monotonic()
+        self.stage_start = self.start
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.start
+
+    def log(self, message: str) -> None:
+        if self.enabled:
+            print(f"[{self.elapsed:7.1f}s] {message}", flush=True)
+
+    def stage(self, message: str) -> None:
+        self.stage_start = time.monotonic()
+        self.log(message)
+
+    def done(self, message: str) -> None:
+        self.log(f"{message}（耗时 {time.monotonic() - self.stage_start:.1f}s）")
 
 
 def _json_dump(path: Path, data: Any) -> None:
@@ -390,8 +415,10 @@ def write_outputs(
 
 
 async def run(args: argparse.Namespace) -> FindResult | None:
+    progress = Progress(enabled=not args.quiet)
     settings = build_settings()
     settings.verbosity = 0
+    progress.stage("加载语料缓存与索引……")
     corpus = await load_corpus(
         settings,
         args.cache,
@@ -400,7 +427,7 @@ async def run(args: argparse.Namespace) -> FindResult | None:
         args.build_report,
         args.manifest,
     )
-    print(
+    progress.log(
         f"语料预检通过：{len(corpus.docs.docs)} 篇 / {len(corpus.docs.texts):,} chunks；"
         f"解析失败 {corpus.coverage['parse_failures']} 个文件"
     )
@@ -416,7 +443,9 @@ async def run(args: argparse.Namespace) -> FindResult | None:
         queries = [QuerySpec(**item) for item in previous["queries"]]
     elif args.query_plan:
         queries = load_query_plan(args.query_plan)
+        progress.log(f"使用冻结查询计划：{len(queries)} 条查询")
     else:
+        progress.stage("生成查询计划（LLM 扩展中英文查询变体，可能需要几十秒）……")
         queries, errors = await build_query_plan(
             request,
             args.query,
@@ -424,17 +453,32 @@ async def run(args: argparse.Namespace) -> FindResult | None:
             expand=not args.no_query_expansion,
             max_variants=args.max_variants,
         )
+        if errors:
+            progress.log(f"查询扩展降级：{'；'.join(errors)}")
+        progress.done(f"查询计划就绪：{len(queries)} 条查询")
     queries = _deduplicate_queries(
         [QuerySpec("q000", request.raw_question, "both", "auto", "original"), *queries]
     )
     if args.save_query_plan:
         _json_dump(args.save_query_plan, {"queries": [asdict(q) for q in queries]})
     hybrid = HybridRetriever(corpus.dense, TantivyDocRetriever(corpus.index))
+    progress.stage(f"混合检索（关键词 + 向量，depth={args.depth}）……")
+
+    def retrieval_progress(spec: QuerySpec, channel: str, done: int, total: int) -> None:
+        text = spec.text if len(spec.text) <= 40 else spec.text[:37] + "…"
+        progress.log(f"检索 {done}/{total}：[{channel}] {text}")
+
     retrieval = await hybrid.search(
-        queries, settings.get_embedding_model(), depth=args.depth
+        queries,
+        settings.get_embedding_model(),
+        depth=args.depth,
+        on_progress=retrieval_progress,
     )
     errors.extend(retrieval.errors)
+    for error in retrieval.errors:
+        progress.log(f"检索通道失败（已保留其他结果）：{error}")
     candidates = retrieval.candidates
+    progress.done(f"检索完成：{len(candidates)} 篇候选论文")
     if args.strict_corpus:
         present = {candidate.dockey for candidate in candidates}
         candidates.extend(
@@ -442,11 +486,13 @@ async def run(args: argparse.Namespace) -> FindResult | None:
             for dockey in sorted(set(corpus.docs.docs) - present)
         )
     builder = EvidenceBuilder(corpus.texts_by_dockey, corpus.dense.chunk_by_id)
+    progress.stage(f"构建 {len(candidates)} 篇论文的证据片段……")
     packs = {candidate.dockey: builder.build(candidate) for candidate in candidates}
     expanded = {
         candidate.dockey: builder.build(candidate, expanded=True)
         for candidate in candidates
     }
+    progress.done("证据片段构建完成")
     all_packs = dict(packs)
     for dockey, pack in expanded.items():
         all_packs[f"{dockey}:expanded"] = pack
@@ -463,7 +509,10 @@ async def run(args: argparse.Namespace) -> FindResult | None:
         if candidate.dockey in cached and cached[candidate.dockey][0] == keys[candidate.dockey]
     }
     remaining = [candidate for candidate in candidates if candidate.dockey not in verdicts]
+    if verdicts:
+        progress.log(f"断点复用：{len(verdicts)} 篇已完成复核，剩余 {len(remaining)} 篇")
     if args.retrieve_only:
+        progress.log("retrieve-only：跳过 LLM 复核")
         for candidate in remaining:
             verdicts[candidate.dockey] = PaperVerdict(
                 candidate.dockey,
@@ -483,6 +532,29 @@ async def run(args: argparse.Namespace) -> FindResult | None:
                     + "\n"
                 )
 
+        progress.stage(
+            f"逐篇 LLM 复核 {len(remaining)} 篇（并发 {args.concurrency}，"
+            "每篇需 1~3 次模型调用，请耐心等待）……"
+        )
+        tally = {"core": 0, "background": 0, "irrelevant": 0, "uncertain": 0, "review_failed": 0}
+
+        def review_progress(done: int, total: int, verdict: PaperVerdict) -> None:
+            if verdict.review_status == "review_failed":
+                tally["review_failed"] += 1
+                label = "失败"
+            elif verdict.review_status == "pending":
+                label = "超出复核预算，待复核"
+            else:
+                tally[verdict.centrality] += 1
+                label = verdict.centrality
+                if verdict.centrality == "core":
+                    label += f"/{verdict.stance}"
+            progress.log(
+                f"复核 {done}/{total}：{verdict.docname} → {label}"
+                f"（core {tally['core']} / background {tally['background']} / "
+                f"irrelevant {tally['irrelevant']} / 失败 {tally['review_failed']}）"
+            )
+
         verdicts.update(
             await PaperReviewer().review_many(
                 request,
@@ -492,8 +564,10 @@ async def run(args: argparse.Namespace) -> FindResult | None:
                 concurrency=args.concurrency,
                 max_review=args.max_review,
                 on_verdict=checkpoint,
+                on_progress=review_progress,
             )
         )
+        progress.done("LLM 复核完成")
     coverage = {
         **corpus.coverage,
         "strict_corpus": args.strict_corpus,
@@ -511,9 +585,11 @@ async def run(args: argparse.Namespace) -> FindResult | None:
         coverage,
         errors,
     )
+    progress.stage("写出结果文件……")
     write_outputs(result, output_dir, corpus.docs, corpus.manifest, all_packs, keys)
-    print(f"结果目录：{output_dir}")
-    print(f"统计：{result.counts}；完整运行：{result.is_complete}")
+    progress.log(f"结果目录：{output_dir}")
+    progress.log(f"统计：{result.counts}；完整运行：{result.is_complete}")
+    progress.done(f"全部完成，总耗时 {progress.elapsed:.1f}s")
     return result
 
 
@@ -534,6 +610,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict-corpus", action="store_true", help="全部已索引论文至少复核一次")
     parser.add_argument("--retrieve-only", action="store_true", help="只生成候选，不调用复核LLM")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--quiet", action="store_true", help="关闭运行过程输出，仅保留最终结果")
     parser.add_argument("--resume", type=Path, help="已有运行目录，复用相同证据的完成项")
     parser.add_argument("--output-dir", type=Path, default=BASE_DIR / "reviews")
     parser.add_argument("--run-id")
